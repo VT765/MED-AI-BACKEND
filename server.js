@@ -2,11 +2,9 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import connectDB from "./config/db.js";
-import admin from "./config/firebase.js";
-import bcrypt from "bcryptjs";
-import User from "./models/User.js";
 import Document from "./models/Document.js";
 import { protect } from "./middleware/auth.js";
+import authRoutes from "./routes/auth.js";
 import upload from "./middleware/upload.js";
 import fs from "fs";
 import path from "path";
@@ -43,6 +41,12 @@ if (!process.env.OPENAI_API_KEY) {
   );
 }
 
+if (!process.env.JWT_SECRET) {
+  console.error(
+    "JWT_SECRET is not set. Please add JWT_SECRET to your .env file."
+  );
+}
+
 connectDB();
 
 const openai = process.env.OPENAI_API_KEY
@@ -64,148 +68,8 @@ app.use((req, res, next) => {
 });
 app.use('/uploads', express.static('uploads'));
 
-// 🔐 FIREBASE PHONE AUTH — VERIFY & CREATE USER
-app.post("/api/auth/verify-phone", async (req, res) => {
-  const authHeader = req.headers.authorization;
-
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ authenticated: false, message: "Missing or invalid Authorization header" });
-  }
-
-  const idToken = authHeader.split(" ")[1];
-
-  try {
-    const decoded = await admin.auth().verifyIdToken(idToken);
-
-    if (!decoded.phone_number) {
-      return res.status(400).json({ authenticated: false, message: "Token does not contain a phone number" });
-    }
-
-    const phone = decoded.phone_number;
-    const firebaseUid = decoded.uid;
-
-    // Find existing user or create a new one
-    let user = await User.findOne({ firebaseUid });
-    let isNewUser = false;
-
-    if (!user) {
-      user = await User.create({
-        firebaseUid,
-        phone,
-        authProvider: "phone",
-        profileComplete: false,
-        username: null,
-        email: null,
-        password: null,
-      });
-      isNewUser = true;
-      console.log("New user created via Firebase:", user._id);
-    }
-
-    res.json({
-      authenticated: true,
-      profileComplete: user.profileComplete,
-      isNewUser,
-      user: {
-        id: user._id,
-        phone: user.phone,
-        username: user.username,
-        email: user.email || undefined,
-        authProvider: user.authProvider,
-      },
-    });
-  } catch (error) {
-    console.error("Firebase verify-phone error:", error);
-    res.status(401).json({ authenticated: false, message: "Invalid Firebase token", error: error.message });
-  }
-});
-
-// 📝 COMPLETE PROFILE — set username, email, optional password
-app.post("/api/auth/complete-profile", protect, async (req, res) => {
-  try {
-    const user = req.user;
-
-    // Prevent double-completion (idempotency guard)
-    if (user.profileComplete) {
-      return res.status(400).json({ message: "Profile is already complete" });
-    }
-
-    const { username, email, password } = req.body;
-
-    // ── Validate required fields ──
-    if (!username || typeof username !== "string" || !username.trim()) {
-      return res.status(400).json({ message: "Username is required" });
-    }
-    if (!email || typeof email !== "string" || !email.trim()) {
-      return res.status(400).json({ message: "Email is required" });
-    }
-
-    const trimmedUsername = username.trim();
-    const trimmedEmail = email.trim().toLowerCase();
-
-    // ── Validate email format ──
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(trimmedEmail)) {
-      return res.status(400).json({ message: "Invalid email format" });
-    }
-
-    // ── Check uniqueness ──
-    const existingUsername = await User.findOne({ username: trimmedUsername, _id: { $ne: user._id } });
-    if (existingUsername) {
-      return res.status(409).json({ message: "Username is already taken" });
-    }
-
-    const existingEmail = await User.findOne({ email: trimmedEmail, _id: { $ne: user._id } });
-    if (existingEmail) {
-      return res.status(409).json({ message: "Email is already in use" });
-    }
-
-    // ── Update user ──
-    user.username = trimmedUsername;
-    user.email = trimmedEmail;
-    user.profileComplete = true;
-
-    // Hash password if provided
-    if (password && typeof password === "string" && password.length >= 6) {
-      const salt = await bcrypt.genSalt(10);
-      user.password = await bcrypt.hash(password, salt);
-    } else if (password) {
-      return res.status(400).json({ message: "Password must be at least 6 characters" });
-    }
-
-    await user.save();
-
-    res.json({
-      message: "Profile completed successfully",
-      profileComplete: true,
-      user: {
-        id: user._id,
-        phone: user.phone,
-        username: user.username,
-        email: user.email,
-        authProvider: user.authProvider,
-      },
-    });
-  } catch (error) {
-    console.error("Complete profile error:", error);
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
-});
-
-// 👤 GET CURRENT USER
-app.get("/api/auth/me", protect, async (req, res) => {
-  res.json({
-    user: {
-      id: req.user._id,
-      username: req.user.username,
-      phone: req.user.phone,
-      email: req.user.email || undefined,
-      authProvider: req.user.authProvider,
-      profileComplete: req.user.profileComplete,
-      createdAt: req.user.createdAt,
-    },
-  });
-});
+// 🔐 AUTH ROUTES (signup, login, me)
+app.use("/api/auth", authRoutes);
 
 // 📄 UPLOAD DOCUMENT
 app.post("/api/documents/upload", protect, upload.single("file"), async (req, res) => {

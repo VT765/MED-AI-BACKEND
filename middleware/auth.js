@@ -1,4 +1,4 @@
-import admin from "../config/firebase.js";
+import jwt from "jsonwebtoken";
 import User from "../models/User.js";
 
 const protect = async (req, res, next) => {
@@ -11,9 +11,9 @@ const protect = async (req, res, next) => {
     try {
       token = req.headers.authorization.split(" ")[1];
 
-      const decoded = await admin.auth().verifyIdToken(token);
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-      req.user = await User.findOne({ firebaseUid: decoded.uid });
+      req.user = await User.findById(decoded.id);
 
       if (!req.user) {
         return res.status(401).json({ message: "Not authorized, user not found" });
@@ -21,7 +21,7 @@ const protect = async (req, res, next) => {
 
       next();
     } catch (error) {
-      console.error("Firebase token verification error:", error.message);
+      console.error("JWT verification error:", error.message);
       res.status(401).json({ message: "Not authorized, token failed" });
     }
   }
