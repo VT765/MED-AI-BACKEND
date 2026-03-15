@@ -44,7 +44,7 @@ async def upload_document(
     file_url = f"uploads/{safe_name}"
     db = get_db()
     doc = document_doc(
-        user_id=ObjectId(user["_id"]),
+        user_id=user["_id"],
         filename=safe_name,
         original_name=file.filename or "document.pdf",
         file_url=file_url,

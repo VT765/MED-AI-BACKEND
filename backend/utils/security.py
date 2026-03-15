@@ -1,26 +1,26 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 from config import JWT_ALGORITHM, JWT_EXPIRE_DAYS, JWT_SECRET
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    pwd_bytes = password.encode("utf-8")
+    salt = bcrypt.gensalt(rounds=10)
+    return bcrypt.hashpw(pwd_bytes, salt).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 
 def create_token(user_id: str) -> str:
     if not JWT_SECRET:
         raise RuntimeError("JWT_SECRET is not set")
-    expire = datetime.utcnow() + timedelta(days=JWT_EXPIRE_DAYS)
+    expire = datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRE_DAYS)
     payload = {"id": user_id, "exp": expire}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 

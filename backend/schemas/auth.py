@@ -19,6 +19,12 @@ class UserResponse(BaseModel):
     username: str
     email: str
     createdAt: Optional[str] = None
+    phone: Optional[str] = None
+
+
+class MeUserResponse(UserResponse):
+    authProvider: str = "email"
+    profileComplete: bool = False
 
 
 class AuthResponse(BaseModel):
@@ -27,4 +33,4 @@ class AuthResponse(BaseModel):
 
 
 class MeResponse(BaseModel):
-    user: UserResponse
+    user: MeUserResponse

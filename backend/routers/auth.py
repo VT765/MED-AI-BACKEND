@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from database import get_db
 from deps import get_current_user
 from models.user import user_doc
-from schemas.auth import AuthResponse, LoginRequest, MeResponse, SignupRequest, UserResponse
+from schemas.auth import AuthResponse, LoginRequest, MeResponse, MeUserResponse, SignupRequest, UserResponse
 from utils.security import create_token, hash_password, verify_password
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -75,11 +75,17 @@ async def login(body: LoginRequest):
 @router.get("/me", response_model=MeResponse)
 async def get_me(user: dict = Depends(get_current_user)):
     created_at = user.get("createdAt")
+    username = user.get("username")
+    phone = user.get("phone", "")
+    profile_complete = bool(username and user.get("email"))
     return MeResponse(
-        user=UserResponse(
+        user=MeUserResponse(
             id=str(user["_id"]),
-            username=user["username"],
+            username=username,
             email=user["email"],
             createdAt=created_at.isoformat() if created_at else None,
+            phone=phone or "",
+            authProvider="email",
+            profileComplete=profile_complete,
         )
     )

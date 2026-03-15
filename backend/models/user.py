@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from bson import ObjectId
@@ -10,8 +10,8 @@ def user_doc(username: str, email: str, password_hash: str, phone: Optional[str]
         "email": email.strip().lower(),
         "password": password_hash,
         "phone": phone or None,
-        "createdAt": datetime.utcnow(),
-        "updatedAt": datetime.utcnow(),
+        "createdAt": datetime.now(timezone.utc),
+        "updatedAt": datetime.now(timezone.utc),
     }
 
 

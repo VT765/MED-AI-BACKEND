@@ -27,7 +27,7 @@ async def chat(body: ChatRequest, user: dict = Depends(get_current_user)):
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    if document["user"] != user["_id"]:
+    if str(document["user"]) != str(user["_id"]):
         raise HTTPException(status_code=401, detail="Not authorized to access this document")
 
     if not OPENAI_API_KEY:

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from bson import ObjectId
@@ -17,8 +17,8 @@ def document_doc(
         "originalName": original_name,
         "fileUrl": file_url,
         "extractedText": extracted_text or "",
-        "createdAt": datetime.utcnow(),
-        "updatedAt": datetime.utcnow(),
+        "createdAt": datetime.now(timezone.utc),
+        "updatedAt": datetime.now(timezone.utc),
     }
 
 

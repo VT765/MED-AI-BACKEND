@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -23,7 +24,15 @@ if not OPENAI_API_KEY:
 if not JWT_SECRET:
     print("JWT_SECRET is not set. Please add JWT_SECRET to your .env file.")
 
-app = FastAPI(title="Med-AI Backend")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await connect_db()
+    yield
+    await close_db()
+
+
+app = FastAPI(title="Med-AI Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,16 +85,6 @@ app.mount("/uploads", StaticFiles(directory=str(uploads_path)), name="uploads")
 app.include_router(auth.router)
 app.include_router(documents.router)
 app.include_router(chat.router)
-
-
-@app.on_event("startup")
-async def startup():
-    await connect_db()
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    await close_db()
 
 
 if __name__ == "__main__":
