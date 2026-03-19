@@ -11,7 +11,7 @@ from fastapi.exceptions import RequestValidationError
 
 from config import JWT_SECRET, MONGO_URI, OPENAI_API_KEY, PORT, UPLOAD_DIR
 from database import close_db, connect_db
-from routers import auth, chat, documents
+from routers import auth, chat, documents, report
 
 if not MONGO_URI:
     print(
@@ -84,6 +84,7 @@ app.mount("/uploads", StaticFiles(directory=str(uploads_path)), name="uploads")
 
 app.include_router(auth.router)
 app.include_router(documents.router)
+app.include_router(report.router)
 app.include_router(chat.router)
 
 

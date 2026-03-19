@@ -57,3 +57,7 @@ uploads/
 # OS Files
 .DS_Store
 Thumbs.db
+
+
+# Dataset 
+lbmaske

@@ -20,3 +20,4 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 30
+LLM_SERVICE_URL = os.getenv("LLM_SERVICE_URL", "http://localhost:8001")
