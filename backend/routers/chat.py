@@ -20,23 +20,24 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 # ── Groq config ──────────────────────────────────────────────
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.1-8b-instant"
-TEMPERATURE = 0.5
+TEMPERATURE = 0.65
 MAX_HISTORY_MESSAGES = 20
-# Keep replies short — 256 tokens ≈ 3-4 sentences
-MAX_TOKENS = 256
+MAX_TOKENS = 512
+
+# Number of user messages before switching from questioning to guidance
+GUIDANCE_THRESHOLD = 3
 
 # ── System prompt ────────────────────────────────────────────
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "chat_prompt.md"
+_FALLBACK_PROMPT = "You are Med-AI, a friendly doctor. Answer in simple English only. Never use Hindi or Hinglish. Never diagnose or prescribe."
 
 
 def _load_system_prompt() -> str:
+    """Load system prompt fresh from file each time."""
     try:
         return _PROMPT_PATH.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return "You are Med-AI, a friendly medical assistant. Answer in 2-3 short sentences using simple English. Never diagnose or prescribe."
-
-
-SYSTEM_PROMPT = _load_system_prompt()
+        return _FALLBACK_PROMPT
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -107,6 +108,44 @@ def _call_groq(messages: list[dict]) -> str:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 
+# ── Conversation stage ───────────────────────────────────────
+
+def _get_conversation_stage(messages: list[dict]) -> str:
+    """
+    Determine conversation stage based on number of user messages.
+    - 0–2 user messages → 'questioning' (ask follow-ups, gather info)
+    - 3+  user messages → 'guidance' (provide advice and suggestions)
+    """
+    user_count = sum(1 for m in messages if m.get("role") == "user")
+    return "guidance" if user_count >= GUIDANCE_THRESHOLD else "questioning"
+
+
+def _build_system_prompt(stage: str, is_first_message: bool) -> str:
+    """
+    Build the system prompt with a stage hint appended.
+    The base prompt in chat_prompt.md already describes both stages;
+    the hint tells the LLM which stage to use right now.
+    """
+    hint = ""
+    if stage == "questioning":
+        hint = (
+            "\n\n[CURRENT STAGE: QUESTIONING]\n"
+            "You do NOT have enough information yet. "
+            "Ask 1-2 short follow-up questions. Keep response to 2-3 lines. "
+            "Do NOT give advice or medications yet."
+        )
+    else:
+        hint = (
+            "\n\n[CURRENT STAGE: GUIDANCE]\n"
+            "You now have enough context from the patient. "
+            "Provide helpful, specific guidance including self-care tips "
+            "and OTC medicine suggestions (no dosage). "
+            "Keep it conversational and natural."
+        )
+
+    return _load_system_prompt() + hint
+
+
 # ── Routes ───────────────────────────────────────────────────
 
 @router.post("", response_model=ChatMessageResponse)
@@ -138,8 +177,13 @@ async def send_message(body: ChatMessageRequest, user: dict = Depends(get_curren
     # Build messages array for Groq (system + recent history + new message)
     history = session.get("messages", [])
     recent = history[-MAX_HISTORY_MESSAGES:] if len(history) > MAX_HISTORY_MESSAGES else history
+    is_first_message = len(history) == 0
 
-    groq_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # Determine conversation stage (questioning vs guidance)
+    stage = _get_conversation_stage(history)
+    system_prompt = _build_system_prompt(stage, is_first_message)
+
+    groq_messages = [{"role": "system", "content": system_prompt}]
     for msg in recent:
         groq_messages.append({"role": msg["role"], "content": msg["content"]})
     groq_messages.append({"role": "user", "content": body.message})
