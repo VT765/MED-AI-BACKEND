@@ -11,6 +11,7 @@ load_dotenv()
 
 MONGO_URI = os.getenv("MONGO_URI")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 JWT_SECRET = os.getenv("JWT_SECRET")
 PORT = int(os.getenv("PORT", "3000"))
 
