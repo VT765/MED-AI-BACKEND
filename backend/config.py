@@ -22,3 +22,9 @@ MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 30
 LLM_SERVICE_URL = os.getenv("LLM_SERVICE_URL", "http://localhost:8001")
+
+# Optional local MongoDB URI for development fallback
+MONGO_URI_LOCAL = os.getenv("MONGO_URI_LOCAL")
+
+# DEBUG flag to allow insecure TLS for local development (use with caution)
+DEBUG = os.getenv("DEBUG", "False").lower() == "true"

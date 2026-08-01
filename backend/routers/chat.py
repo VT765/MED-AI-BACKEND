@@ -1,8 +1,10 @@
 """
 Chat router — conversational AI doctor powered by Groq (llama-3.1-8b-instant).
 Single active session per user, stored in MongoDB `chat_sessions` collection.
+Guest sessions stored in `guest_chat_sessions` with auto-expiry.
 """
 
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,17 +29,28 @@ MAX_TOKENS = 512
 # Number of user messages before switching from questioning to guidance
 GUIDANCE_THRESHOLD = 3
 
-# ── System prompt ────────────────────────────────────────────
-_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "chat_prompt.md"
+# ── System prompts ───────────────────────────────────────────
+_PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
+_PROMPT_PATH = _PROMPT_DIR / "chat_prompt.md"
+_GUEST_PROMPT_PATH = _PROMPT_DIR / "guest_chat_prompt.md"
 _FALLBACK_PROMPT = "You are Med-AI, a friendly doctor. Answer in simple English only. Never use Hindi or Hinglish. Never diagnose or prescribe."
+_FALLBACK_GUEST_PROMPT = "You are Med-AI, an evidence-based medical assistant. The user is NOT authenticated. Provide general medical guidance only. Never personalize. End with a confidence level."
 
 
 def _load_system_prompt() -> str:
-    """Load system prompt fresh from file each time."""
+    """Load authenticated system prompt fresh from file each time."""
     try:
         return _PROMPT_PATH.read_text(encoding="utf-8")
     except FileNotFoundError:
         return _FALLBACK_PROMPT
+
+
+def _load_guest_system_prompt() -> str:
+    """Load guest system prompt fresh from file each time."""
+    try:
+        return _GUEST_PROMPT_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _FALLBACK_GUEST_PROMPT
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -248,3 +261,132 @@ async def new_chat(user: dict = Depends(get_current_user)):
 
     session = await _get_or_create_session(db, user_id)
     return {"session_id": str(session["_id"]), "message": "New chat session created"}
+
+
+# ══════════════════════════════════════════════════════════════
+# GUEST CHAT ENDPOINTS — No authentication required
+# ══════════════════════════════════════════════════════════════
+
+def _generate_guest_session_id() -> str:
+    """Generate a temporary guest session ID: guest_xxxxxxxxx."""
+    return f"guest_{uuid.uuid4().hex[:12]}"
+
+
+async def _get_or_create_guest_session(db, session_id: str | None) -> dict:
+    """Get an existing guest session by ID, or create a new one."""
+    if session_id:
+        session = await db.guest_chat_sessions.find_one({"session_id": session_id})
+        if session:
+            return session
+
+    new_id = _generate_guest_session_id()
+    new_session = {
+        "session_id": new_id,
+        "messages": [],
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    await db.guest_chat_sessions.insert_one(new_session)
+    return new_session
+
+
+def _build_guest_system_prompt(stage: str) -> str:
+    """Build guest system prompt with stage hint."""
+    hint = ""
+    if stage == "questioning":
+        hint = (
+            "\n\n[CURRENT STAGE: QUESTIONING]\n"
+            "You do NOT have enough information yet. "
+            "Ask 1-2 short follow-up questions. Keep response to 2-3 lines. "
+            "Do NOT give advice or medications yet."
+        )
+    else:
+        hint = (
+            "\n\n[CURRENT STAGE: GUIDANCE]\n"
+            "You now have enough context from the patient. "
+            "Provide helpful, specific guidance including self-care tips "
+            "and OTC medicine suggestions (no dosage). "
+            "Keep it conversational and natural."
+        )
+    return _load_guest_system_prompt() + hint
+
+
+class GuestChatRequest(ChatMessageRequest):
+    """Same as ChatMessageRequest — reuse existing schema."""
+    pass
+
+
+@router.post("/guest", response_model=ChatMessageResponse)
+async def guest_send_message(body: GuestChatRequest):
+    """Send a guest message and get an AI reply. No authentication required."""
+    db = get_db()
+
+    session = await _get_or_create_guest_session(db, body.session_id)
+    session_id = session["session_id"]
+    now = _now_iso()
+
+    user_msg = {"role": "user", "content": body.message, "timestamp": now}
+
+    # Build messages array for Groq (guest prompt + history + new message)
+    history = session.get("messages", [])
+    recent = history[-MAX_HISTORY_MESSAGES:] if len(history) > MAX_HISTORY_MESSAGES else history
+
+    stage = _get_conversation_stage(history)
+    system_prompt = _build_guest_system_prompt(stage)
+
+    groq_messages = [{"role": "system", "content": system_prompt}]
+    for msg in recent:
+        groq_messages.append({"role": msg["role"], "content": msg["content"]})
+    groq_messages.append({"role": "user", "content": body.message})
+
+    # Call LLM
+    reply_text = _call_groq(groq_messages)
+
+    reply_timestamp = _now_iso()
+    assistant_msg = {"role": "assistant", "content": reply_text, "timestamp": reply_timestamp}
+
+    # Save both messages
+    await db.guest_chat_sessions.update_one(
+        {"session_id": session_id},
+        {
+            "$push": {"messages": {"$each": [user_msg, assistant_msg]}},
+            "$set": {"updated_at": datetime.now(timezone.utc)},
+        },
+    )
+
+    return ChatMessageResponse(
+        session_id=session_id,
+        reply=reply_text,
+        timestamp=reply_timestamp,
+    )
+
+
+@router.get("/guest/history", response_model=ChatHistoryResponse)
+async def guest_get_history(session_id: str = ""):
+    """Get guest chat session history. No authentication required."""
+    if not session_id:
+        return ChatHistoryResponse(session_id="", messages=[])
+
+    db = get_db()
+    session = await db.guest_chat_sessions.find_one({"session_id": session_id})
+
+    if not session:
+        return ChatHistoryResponse(session_id="", messages=[])
+
+    messages_out = [
+        ChatMessageOut(role=m["role"], content=m["content"], timestamp=m["timestamp"])
+        for m in session.get("messages", [])
+    ]
+
+    return ChatHistoryResponse(
+        session_id=session["session_id"],
+        messages=messages_out,
+    )
+
+
+@router.post("/guest/new")
+async def guest_new_chat():
+    """Start a fresh guest chat session. No authentication required."""
+    db = get_db()
+    session = await _get_or_create_guest_session(db, None)
+    return {"session_id": session["session_id"], "message": "New guest chat session created"}

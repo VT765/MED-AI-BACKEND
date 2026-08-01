@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from pymongo.errors import ServerSelectionTimeoutError, PyMongoError
 
 from database import get_db
 from deps import get_current_user
@@ -46,11 +47,22 @@ async def signup(body: SignupRequest):
 
 @router.post("/login", response_model=AuthResponse)
 async def login(body: LoginRequest):
-    db = get_db()
-    user = await db.users.find_one(
-        {"email": body.email.strip().lower()},
-        projection={"password": 1, "username": 1, "email": 1, "_id": 1},
-    )
+    try:
+        db = get_db()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    try:
+        user = await db.users.find_one(
+            {"email": body.email.strip().lower()},
+            projection={"password": 1, "username": 1, "email": 1, "_id": 1},
+        )
+    except ServerSelectionTimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail="Database is temporarily unavailable. Please try again later.",
+        )
+    except PyMongoError as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

@@ -3,6 +3,7 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from bson import ObjectId
+from pymongo.errors import ServerSelectionTimeoutError, PyMongoError
 
 from database import get_db
 from utils.security import decode_token
@@ -31,11 +32,26 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authorized, token failed",
         )
-    db = get_db()
-    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    try:
+        db = get_db()
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    try:
+        user = await db.users.find_one({"_id": ObjectId(user_id)})
+    except ServerSelectionTimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail="Database is temporarily unavailable. Please try again later.",
+        )
+    except PyMongoError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error: {e}",
+        )
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authorized, user not found",
         )
     return user
+
