@@ -55,3 +55,23 @@ async def get_current_user(
         )
     return user
 
+
+async def get_optional_user(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)],
+):
+    """Same as get_current_user but returns None instead of 401 when not authenticated."""
+    if not credentials or not credentials.scheme == "Bearer":
+        return None
+    token = credentials.credentials
+    payload = decode_token(token)
+    if not payload:
+        return None
+    user_id = payload.get("id")
+    if not user_id:
+        return None
+    try:
+        db = get_db()
+        user = await db.users.find_one({"_id": ObjectId(user_id)})
+    except Exception:
+        return None
+    return user

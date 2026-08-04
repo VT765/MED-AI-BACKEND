@@ -1,14 +1,20 @@
 """
 Report analysis route: OCR/extract text → LLM → structured JSON.
+Now persists analysis results to MongoDB for authenticated users.
 """
 
 import tempfile
+from datetime import datetime, timezone
+from typing import Optional
 from pathlib import Path
 
 import requests
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from bson import ObjectId
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from config import LLM_SERVICE_URL, MAX_FILE_SIZE
+from database import get_db
+from deps import get_current_user, get_optional_user
 from utils.pdf_parser import extract_text_from_pdf
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
@@ -56,10 +62,14 @@ def _call_llm_service(text: str) -> dict:
 
 
 @router.post("/analyze")
-async def analyze_report(file: UploadFile = File(...)):
+async def analyze_report(
+    file: UploadFile = File(...),
+    user: Optional[dict] = Depends(get_optional_user),
+):
     """
     Analyze a medical report (PDF or image).
     Flow: Extract text (OCR for images, pypdf for PDF) → LLM → validated JSON.
+    If the user is authenticated, persist the result to MongoDB.
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="Filename required")
@@ -96,6 +106,17 @@ async def analyze_report(file: UploadFile = File(...)):
     result = _call_llm_service(extracted_text)
 
     if "error" in result:
+        # Persist a failed record if user is authenticated
+        if user:
+            db = get_db()
+            await db.report_analyses.insert_one({
+                "user_id": str(user["_id"]),
+                "filename": file.filename or "unknown",
+                "status": "Failed",
+                "analysis": None,
+                "error": result.get("error", "Unknown error"),
+                "created_at": datetime.now(timezone.utc),
+            })
         detail = result.get("details", result["error"])
         raise HTTPException(status_code=502, detail=str(detail) if not isinstance(detail, str) else detail)
 
@@ -103,4 +124,67 @@ async def analyze_report(file: UploadFile = File(...)):
     if not analysis:
         raise HTTPException(status_code=502, detail="LLM service returned no analysis")
 
+    # Persist successful analysis for authenticated users
+    if user:
+        db = get_db()
+        await db.report_analyses.insert_one({
+            "user_id": str(user["_id"]),
+            "filename": file.filename or "unknown",
+            "status": "Completed",
+            "analysis": analysis,
+            "created_at": datetime.now(timezone.utc),
+        })
+
     return analysis
+
+
+# ── History endpoints (authenticated) ────────────────────────
+
+
+@router.get("/history")
+async def list_reports(user: dict = Depends(get_current_user)):
+    """List all past report analyses for the authenticated user, newest first."""
+    db = get_db()
+    user_id = str(user["_id"])
+
+    cursor = db.report_analyses.find(
+        {"user_id": user_id},
+        sort=[("created_at", -1)],
+    )
+
+    reports = []
+    async for doc in cursor:
+        reports.append({
+            "report_id": str(doc["_id"]),
+            "filename": doc.get("filename", "Unknown"),
+            "status": doc.get("status", "Unknown"),
+            "created_at": doc["created_at"].isoformat() if hasattr(doc.get("created_at", ""), "isoformat") else str(doc.get("created_at", "")),
+        })
+
+    return {"reports": reports}
+
+
+@router.get("/history/{report_id}")
+async def get_report(report_id: str, user: dict = Depends(get_current_user)):
+    """Get a single past report analysis by ID."""
+    db = get_db()
+    user_id = str(user["_id"])
+
+    try:
+        doc = await db.report_analyses.find_one({
+            "_id": ObjectId(report_id),
+            "user_id": user_id,
+        })
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid report ID")
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    return {
+        "report_id": str(doc["_id"]),
+        "filename": doc.get("filename", "Unknown"),
+        "status": doc.get("status", "Unknown"),
+        "analysis": doc.get("analysis"),
+        "created_at": doc["created_at"].isoformat() if hasattr(doc.get("created_at", ""), "isoformat") else str(doc.get("created_at", "")),
+    }

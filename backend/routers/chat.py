@@ -263,6 +263,87 @@ async def new_chat(user: dict = Depends(get_current_user)):
     return {"session_id": str(session["_id"]), "message": "New chat session created"}
 
 
+@router.get("/sessions")
+async def list_sessions(user: dict = Depends(get_current_user)):
+    """List all chat sessions for the authenticated user, newest first."""
+    db = get_db()
+    user_id = str(user["_id"])
+
+    cursor = db.chat_sessions.find(
+        {"user_id": user_id},
+        sort=[("updated_at", -1)],
+    )
+
+    sessions = []
+    async for session in cursor:
+        messages = session.get("messages", [])
+        # Derive title from the first user message
+        title = "New conversation"
+        for msg in messages:
+            if msg.get("role") == "user":
+                title = msg["content"][:60]
+                break
+
+        sessions.append({
+            "session_id": str(session["_id"]),
+            "title": title,
+            "active": session.get("active", False),
+            "message_count": len(messages),
+            "created_at": session.get("created_at", "").isoformat() if hasattr(session.get("created_at", ""), "isoformat") else str(session.get("created_at", "")),
+            "updated_at": session.get("updated_at", "").isoformat() if hasattr(session.get("updated_at", ""), "isoformat") else str(session.get("updated_at", "")),
+        })
+
+    return {"sessions": sessions}
+
+
+@router.get("/sessions/{session_id}", response_model=ChatHistoryResponse)
+async def get_session_history(session_id: str, user: dict = Depends(get_current_user)):
+    """Get the message history for a specific session."""
+    db = get_db()
+    user_id = str(user["_id"])
+
+    try:
+        session = await db.chat_sessions.find_one({
+            "_id": ObjectId(session_id),
+            "user_id": user_id,
+        })
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid session ID")
+
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    messages_out = [
+        ChatMessageOut(role=m["role"], content=m["content"], timestamp=m["timestamp"])
+        for m in session.get("messages", [])
+    ]
+
+    return ChatHistoryResponse(
+        session_id=str(session["_id"]),
+        messages=messages_out,
+    )
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_session(session_id: str, user: dict = Depends(get_current_user)):
+    """Permanently delete a chat session."""
+    db = get_db()
+    user_id = str(user["_id"])
+
+    try:
+        result = await db.chat_sessions.delete_one({
+            "_id": ObjectId(session_id),
+            "user_id": user_id,
+        })
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid session ID")
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return {"message": "Chat session deleted"}
+
+
 # ══════════════════════════════════════════════════════════════
 # GUEST CHAT ENDPOINTS — No authentication required
 # ══════════════════════════════════════════════════════════════
