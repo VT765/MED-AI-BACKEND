@@ -16,6 +16,7 @@ from config import LLM_SERVICE_URL, MAX_FILE_SIZE
 from database import get_db
 from deps import get_current_user, get_optional_user
 from utils.pdf_parser import extract_text_from_pdf
+from utils.patient_profile import build_patient_profile_facts
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 
@@ -36,12 +37,12 @@ def _extract_text_from_file(file_path: Path, content_type: str) -> str:
     raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF or image (JPEG/PNG).")
 
 
-def _call_llm_service(text: str) -> dict:
+def _call_llm_service(text: str, patient_context: str = "") -> dict:
     """Send extracted text to LLM service. Returns analysis dict or error dict."""
     try:
         response = requests.post(
             f"{LLM_SERVICE_URL.rstrip('/')}/analyze",
-            json={"text": text},
+            json={"text": text, "patient_context": patient_context},
             timeout=90,
         )
     except requests.RequestException as e:
@@ -103,7 +104,9 @@ async def analyze_report(
     if not extracted_text or not extracted_text.strip():
         raise HTTPException(status_code=400, detail="No readable text found in the document")
 
-    result = _call_llm_service(extracted_text)
+    # Personalise report interpretation with the authenticated user's profile.
+    patient_context = build_patient_profile_facts(user.get("profile")) if user else ""
+    result = _call_llm_service(extracted_text, patient_context)
 
     if "error" in result:
         # Persist a failed record if user is authenticated

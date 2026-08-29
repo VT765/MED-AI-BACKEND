@@ -4,27 +4,40 @@ Single active session per user, stored in MongoDB `chat_sessions` collection.
 Guest chat is stateless — no history or data is stored.
 """
 
+import json
+import re
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from config import GROQ_API_KEY
 from database import get_db
-from deps import get_current_user
+from deps import get_current_user, get_optional_user
 from schemas.chat import ChatHistoryResponse, ChatMessageOut, ChatMessageRequest, ChatMessageResponse
+from utils.patient_profile import build_patient_profile_facts
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 # ── Groq config ──────────────────────────────────────────────
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+WHISPER_MODEL = "whisper-large-v3-turbo"
+MAX_AUDIO_BYTES = 25 * 1024 * 1024  # 25MB — Groq's transcription upload limit
+# NOTE: llama-3.1-8b-instant was decommissioned on Groq; use a currently-available model.
+GROQ_MODEL = "openai/gpt-oss-20b"
 TEMPERATURE = 0.65
 MAX_HISTORY_MESSAGES = 20
-MAX_TOKENS = 700
+# Kept modest to stay within Groq free-tier TPM limits; ample for short replies
+# since reasoning_effort is "low".
+MAX_TOKENS = 800
+# Retry short rate-limit (429) bursts instead of failing the request outright.
+MAX_RATE_LIMIT_RETRIES = 2
+MAX_RATE_LIMIT_WAIT = 8.0  # seconds — cap so a slow reply never hangs the UI
 
 
 # ── System prompts ───────────────────────────────────────────
@@ -78,6 +91,58 @@ async def _get_or_create_session(db, user_id: str) -> dict:
     return new_session
 
 
+def _salvage_failed_generation(failed_generation) -> str:
+    """
+    Recover the assistant's text from a Groq `failed_generation` payload.
+
+    gpt-oss models sometimes emit a normal reply wrapped as a phantom tool call
+    (e.g. {"name": "assistant", "arguments": {"content": "..."}}), which Groq
+    rejects with a `tool_use_failed` error. The real answer is inside that
+    payload — extract and return it so the chat still works.
+    """
+    if not isinstance(failed_generation, str):
+        return ""
+    try:
+        obj = json.loads(failed_generation)
+    except json.JSONDecodeError:
+        return failed_generation.strip()
+
+    if isinstance(obj, dict):
+        args = obj.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = None
+        if isinstance(args, dict) and args.get("content"):
+            return str(args["content"]).strip()
+        if obj.get("content"):
+            return str(obj["content"]).strip()
+    return ""
+
+
+def _parse_retry_after(response, data) -> float:
+    """
+    Determine how long to wait before retrying a 429. Prefers the standard
+    `Retry-After` header, then the "try again in Xs" hint in Groq's message,
+    then a small default. Capped by MAX_RATE_LIMIT_WAIT.
+    """
+    header = response.headers.get("retry-after")
+    if header:
+        try:
+            return min(float(header), MAX_RATE_LIMIT_WAIT)
+        except ValueError:
+            pass
+    msg = ((data or {}).get("error", {}) or {}).get("message", "") if isinstance(data, dict) else ""
+    match = re.search(r"try again in ([\d.]+)s", msg)
+    if match:
+        try:
+            return min(float(match.group(1)) + 0.3, MAX_RATE_LIMIT_WAIT)
+        except ValueError:
+            pass
+    return 3.0
+
+
 def _call_groq(messages: list[dict]) -> str:
     """Call Groq API with message list. Returns assistant reply text."""
     if not GROQ_API_KEY:
@@ -95,28 +160,72 @@ def _call_groq(messages: list[dict]) -> str:
         "messages": messages,
         "temperature": TEMPERATURE,
         "max_tokens": MAX_TOKENS,
+        # gpt-oss models reason before answering; keep it light so the token
+        # budget goes to the actual reply, not the hidden reasoning trace.
+        "reasoning_effort": "low",
     }
 
-    try:
-        response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
-        data = response.json()
+    # On a rate-limit (429), Groq tells us how long to wait (usually a few
+    # seconds). Retry a couple of times so short bursts self-heal instead of
+    # surfacing a raw error to the user.
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        try:
+            response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
+            data = response.json()
 
-        if response.status_code != 200:
-            error_msg = data.get("error", {}).get("message", "Unknown Groq API error")
-            raise HTTPException(status_code=502, detail=f"AI service error: {error_msg}")
+            if response.status_code == 429 and attempt < MAX_RATE_LIMIT_RETRIES:
+                wait = _parse_retry_after(response, data)
+                time.sleep(wait)
+                continue
 
-        if "choices" not in data or not data["choices"]:
-            raise HTTPException(status_code=502, detail="AI returned an empty response")
+            if response.status_code != 200:
+                err = data.get("error", {}) or {}
+                # gpt-oss sometimes returns a valid reply wrapped as a bogus tool
+                # call. Groq flags it as `tool_use_failed`; recover the text.
+                if err.get("code") == "tool_use_failed" and err.get("failed_generation"):
+                    salvaged = _salvage_failed_generation(err["failed_generation"])
+                    if salvaged:
+                        return salvaged
+                if response.status_code == 429:
+                    raise HTTPException(
+                        status_code=429,
+                        detail="The AI is a bit busy right now. Please wait a few seconds and try again.",
+                    )
+                error_msg = err.get("message", "Unknown Groq API error")
+                raise HTTPException(status_code=502, detail=f"AI service error: {error_msg}")
 
-        return data["choices"][0].get("message", {}).get("content", "").strip()
-    except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="AI service timed out. Please try again.")
-    except requests.exceptions.ConnectionError:
-        raise HTTPException(status_code=502, detail="Could not connect to AI service.")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+            if "choices" not in data or not data["choices"]:
+                raise HTTPException(status_code=502, detail="AI returned an empty response")
+
+            return data["choices"][0].get("message", {}).get("content", "").strip()
+        except requests.exceptions.Timeout:
+            raise HTTPException(status_code=504, detail="AI service timed out. Please try again.")
+        except requests.exceptions.ConnectionError:
+            raise HTTPException(status_code=502, detail="Could not connect to AI service.")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+
+# ── Patient profile context ──────────────────────────────────
+
+def _build_patient_profile_context(user: dict) -> str:
+    """
+    Build a patient-profile system message from the user's saved onboarding
+    profile so the AI keeps their personal details in mind during the chat.
+    Returns "" if no profile has been saved yet.
+    """
+    facts = build_patient_profile_facts(user.get("profile"))
+    if not facts:
+        return ""
+    instruction = (
+        "\nKeep this in mind for every reply. Personalise your guidance to this profile "
+        "(age, sex, existing conditions, allergies and current medications). Never suggest "
+        "anything that conflicts with a listed allergy or condition. Do not restate the whole "
+        "profile back to the user."
+    )
+    return facts + instruction
 
 
 # ── Conversation stage ───────────────────────────────────────
@@ -195,6 +304,13 @@ async def send_message(body: ChatMessageRequest, user: dict = Depends(get_curren
     system_prompt = _build_system_prompt(stage, is_first_message)
 
     groq_messages = [{"role": "system", "content": system_prompt}]
+
+    # Inject the patient's saved onboarding profile so the AI doctor keeps
+    # their personal details (age, sex, conditions, allergies, meds) in mind.
+    patient_context = _build_patient_profile_context(user)
+    if patient_context:
+        groq_messages.append({"role": "system", "content": patient_context})
+
     for msg in recent:
         groq_messages.append({"role": msg["role"], "content": msg["content"]})
     groq_messages.append({"role": "user", "content": body.message})
@@ -340,6 +456,59 @@ async def delete_session(session_id: str, user: dict = Depends(get_current_user)
         raise HTTPException(status_code=404, detail="Session not found")
 
     return {"message": "Chat session deleted"}
+
+
+# ── Voice transcription (speech-to-text) ─────────────────────
+
+@router.post("/transcribe")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    user: dict | None = Depends(get_optional_user),
+):
+    """
+    Transcribe a recorded audio clip to text using Groq Whisper.
+    Available in both guest and authenticated chat so users can speak
+    their question instead of typing. Returns {"text": "..."}.
+    """
+    if not GROQ_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Voice input is not available. GROQ_API_KEY is not configured.",
+        )
+
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="No audio received. Please try recording again.")
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=400, detail="Audio is too long (max 25MB). Please record a shorter clip.")
+
+    try:
+        response = requests.post(
+            GROQ_TRANSCRIBE_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files={"file": (file.filename or "recording.webm", audio_bytes, file.content_type or "audio/webm")},
+            # Transcribe as English — the assistant is English-only.
+            data={"model": WHISPER_MODEL, "response_format": "json", "language": "en"},
+            timeout=60,
+        )
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Transcription timed out. Please try again.")
+    except requests.exceptions.RequestException:
+        raise HTTPException(status_code=502, detail="Could not connect to the transcription service.")
+
+    if response.status_code != 200:
+        try:
+            msg = response.json().get("error", {}).get("message", "Transcription failed")
+        except ValueError:
+            msg = "Transcription failed"
+        raise HTTPException(status_code=502, detail=f"Transcription error: {msg}")
+
+    try:
+        text = (response.json().get("text") or "").strip()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Transcription returned an invalid response.")
+
+    return {"text": text}
 
 
 # ══════════════════════════════════════════════════════════════

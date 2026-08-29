@@ -58,15 +58,19 @@ def _clean_ocr_text(text: str) -> str:
     return "\n".join(lines)
 
 
-def build_prompt(ocr_text: str) -> str:
+def build_prompt(ocr_text: str, patient_context: str = "") -> str:
     """
     Build the full analysis prompt for the LLM.
     - Loads script.md for response order and guidelines
+    - Optionally injects the patient's saved health profile for context
     - Injects cleaned OCR text
     - Appends strict JSON schema and rules
 
     Args:
         ocr_text: Raw text extracted from medical report (OCR or PDF)
+        patient_context: Optional patient-profile facts block. Used only to
+            interpret the report in the patient's context; it does NOT relax
+            the JSON-only output contract.
 
     Returns:
         Complete prompt string for the LLM
@@ -77,10 +81,24 @@ def build_prompt(ocr_text: str) -> str:
     if not cleaned:
         cleaned = "(No readable text was extracted from the report. Please indicate this in your response.)"
 
+    patient_block = ""
+    if patient_context and patient_context.strip():
+        patient_block = f"""
+
+---
+
+## Patient Context (background only — for interpretation, do NOT echo verbatim)
+
+Use this to interpret findings in the patient's context (age, sex, existing conditions,
+allergies, medications). Do NOT let it change the required output format below.
+
+{patient_context.strip()}
+"""
+
     prompt = f"""You are a Med-AI assistant. Analyze the following medical report and respond with structured, patient-friendly insights.
 
 {script}
-
+{patient_block}
 ---
 
 ## OCR / Report Text (may contain noise or formatting artifacts)

@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from pathlib import Path
@@ -31,6 +32,7 @@ TEMPERATURE = 0.3
 
 class ReportRequest(BaseModel):
     text: str
+    patient_context: str = ""
 
 
 @app.get("/")
@@ -45,13 +47,23 @@ def _call_groq(prompt: str) -> dict:
         "Content-Type": "application/json",
     }
     payload = {
-        "model": "llama-3.1-8b-instant",
+        # llama-3.1-8b-instant was decommissioned on Groq; use an available model.
+        "model": "openai/gpt-oss-20b",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": TEMPERATURE,
+        "max_tokens": 2000,
+        "reasoning_effort": "low",
     }
     try:
         response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
         data = response.json()
+        # gpt-oss sometimes wraps its output as a bogus tool call → `tool_use_failed`.
+        # The real content sits in `failed_generation`; recover it so parsing can proceed.
+        err = data.get("error", {}) if isinstance(data, dict) else {}
+        if err.get("code") == "tool_use_failed" and err.get("failed_generation"):
+            salvaged = _salvage_failed_generation(err["failed_generation"])
+            if salvaged:
+                return {"content": salvaged}
         if "choices" not in data or not data["choices"]:
             return {"error": "Groq API returned unexpected response", "details": data}
         content = data["choices"][0].get("message", {}).get("content", "")
@@ -60,13 +72,35 @@ def _call_groq(prompt: str) -> dict:
         return {"error": "LLM request failed", "details": str(e)}
 
 
-def query_groq(ocr_text: str) -> dict:
+def _salvage_failed_generation(failed_generation) -> str:
+    """Recover assistant text from a Groq `failed_generation` payload (phantom tool call)."""
+    if not isinstance(failed_generation, str):
+        return ""
+    try:
+        obj = json.loads(failed_generation)
+    except json.JSONDecodeError:
+        return failed_generation.strip()
+    if isinstance(obj, dict):
+        args = obj.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = None
+        if isinstance(args, dict) and args.get("content"):
+            return str(args["content"]).strip()
+        if obj.get("content"):
+            return str(obj["content"]).strip()
+    return ""
+
+
+def query_groq(ocr_text: str, patient_context: str = "") -> dict:
     """
     Build structured prompt, call LLM, parse JSON response.
     Retries once with stricter instruction if parsing fails.
     Returns either parsed structured analysis or error dict.
     """
-    prompt = build_prompt(ocr_text)
+    prompt = build_prompt(ocr_text, patient_context)
     result = _call_groq(prompt)
 
     if "error" in result:
@@ -102,7 +136,7 @@ def analyze(req: ReportRequest):
     """Analyze medical report text. Returns structured JSON or error."""
     if not GROQ_API_KEY:
         return {"error": "GROQ_API_KEY not configured"}
-    return query_groq(req.text)
+    return query_groq(req.text, req.patient_context)
 
 
 if __name__ == "__main__":
