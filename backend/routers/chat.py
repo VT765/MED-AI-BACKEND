@@ -11,9 +11,11 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import edge_tts
 import requests
 from bson import ObjectId
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
+from pydantic import BaseModel
 
 from config import GROQ_API_KEY
 from database import get_db
@@ -44,7 +46,7 @@ MAX_RATE_LIMIT_WAIT = 8.0  # seconds — cap so a slow reply never hangs the UI
 _PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
 _PROMPT_PATH = _PROMPT_DIR / "chat_prompt.md"
 _GUEST_PROMPT_PATH = _PROMPT_DIR / "guest_chat_prompt.md"
-_FALLBACK_PROMPT = "You are Med-AI, a friendly doctor. Answer in simple English only. Never use Hindi or Hinglish. Never diagnose or prescribe."
+_FALLBACK_PROMPT = "You are Med-AI, a friendly doctor. Always reply in the same language the patient writes in (Hindi for Hindi, Hinglish for Hinglish, English for English). Use simple words. Never diagnose or prescribe."
 _FALLBACK_GUEST_PROMPT = "You are Med-AI, an evidence-based medical assistant. The user is NOT authenticated. Provide general medical guidance only. Never personalize. End with a confidence level."
 
 
@@ -487,8 +489,10 @@ async def transcribe_audio(
             GROQ_TRANSCRIBE_URL,
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
             files={"file": (file.filename or "recording.webm", audio_bytes, file.content_type or "audio/webm")},
-            # Transcribe as English — the assistant is English-only.
-            data={"model": WHISPER_MODEL, "response_format": "json", "language": "en"},
+            # No language hint — let Whisper auto-detect so Hindi and other
+            # languages are transcribed as spoken, matching the assistant's
+            # mirror-the-user's-language behavior.
+            data={"model": WHISPER_MODEL, "response_format": "json"},
             timeout=60,
         )
     except requests.exceptions.Timeout:
@@ -509,6 +513,43 @@ async def transcribe_audio(
         raise HTTPException(status_code=502, detail="Transcription returned an invalid response.")
 
     return {"text": text}
+
+
+class TTSRequest(BaseModel):
+    text: str
+
+
+@router.post("/tts")
+async def synthesize_speech(body: TTSRequest):
+    """
+    Text-to-speech for voice mode. Returns MP3 audio bytes.
+
+    Uses Microsoft Edge neural voices via edge-tts (free, multilingual) —
+    browser speechSynthesis is unreliable across Chromium forks, and the
+    reply may be in Hindi or English so the voice is picked per request.
+    """
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="No text to speak.")
+    # Keep requests bounded — voice replies shouldn't be essays anyway.
+    text = text[:3500]
+
+    # Devanagari → Hindi neural voice; otherwise Indian-English voice.
+    voice = "hi-IN-SwaraNeural" if re.search(r"[ऀ-ॿ]", text) else "en-IN-NeerjaNeural"
+
+    try:
+        communicate = edge_tts.Communicate(text, voice)
+        audio = bytearray()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio.extend(chunk["data"])
+    except Exception:
+        raise HTTPException(status_code=502, detail="Voice synthesis failed. Please try again.")
+
+    if not audio:
+        raise HTTPException(status_code=502, detail="Voice synthesis returned no audio.")
+
+    return Response(content=bytes(audio), media_type="audio/mpeg")
 
 
 # ══════════════════════════════════════════════════════════════
