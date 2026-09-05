@@ -31,7 +31,7 @@ GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 WHISPER_MODEL = "whisper-large-v3-turbo"
 MAX_AUDIO_BYTES = 25 * 1024 * 1024  # 25MB — Groq's transcription upload limit
 # NOTE: llama-3.1-8b-instant was decommissioned on Groq; use a currently-available model.
-GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_MODEL = "openai/gpt-oss-120b"
 TEMPERATURE = 0.65
 MAX_HISTORY_MESSAGES = 20
 # Kept modest to stay within Groq free-tier TPM limits; ample for short replies
@@ -162,10 +162,11 @@ def _call_groq(messages: list[dict]) -> str:
         "messages": messages,
         "temperature": TEMPERATURE,
         "max_tokens": MAX_TOKENS,
+    }
+    if "gpt-oss" in GROQ_MODEL:
         # gpt-oss models reason before answering; keep it light so the token
         # budget goes to the actual reply, not the hidden reasoning trace.
-        "reasoning_effort": "low",
-    }
+        payload["reasoning_effort"] = "low"
 
     # On a rate-limit (429), Groq tells us how long to wait (usually a few
     # seconds). Retry a couple of times so short bursts self-heal instead of
@@ -336,6 +337,124 @@ async def send_message(body: ChatMessageRequest, user: dict = Depends(get_curren
         session_id=session_id,
         reply=reply_text,
         timestamp=reply_timestamp,
+    )
+
+
+@router.post("/stream")
+async def send_message_stream(body: ChatMessageRequest, user: dict = Depends(get_current_user)):
+    """
+    Streaming variant of send_message. Emits Server-Sent Events:
+      data: {"delta": "..."}    — incremental reply text
+      data: {"done": true, "session_id": "...", "timestamp": "..."}
+      data: {"error": "..."}    — terminal error
+    The full reply is persisted to the session when the stream completes.
+    """
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=503, detail="AI chat is not available. GROQ_API_KEY is not configured.")
+
+    db = get_db()
+    user_id = str(user["_id"])
+
+    if body.session_id:
+        try:
+            session = await db.chat_sessions.find_one({
+                "_id": ObjectId(body.session_id),
+                "user_id": user_id,
+                "active": True,
+            })
+        except Exception:
+            session = None
+        if not session:
+            session = await _get_or_create_session(db, user_id)
+    else:
+        session = await _get_or_create_session(db, user_id)
+
+    session_id = str(session["_id"])
+    now = _now_iso()
+    user_msg = {"role": "user", "content": body.message, "timestamp": now}
+
+    history = session.get("messages", [])
+    recent = history[-MAX_HISTORY_MESSAGES:] if len(history) > MAX_HISTORY_MESSAGES else history
+    stage = _get_conversation_stage(history)
+    system_prompt = _build_system_prompt(stage, len(history) == 0)
+
+    groq_messages = [{"role": "system", "content": system_prompt}]
+    patient_context = _build_patient_profile_context(user)
+    if patient_context:
+        groq_messages.append({"role": "system", "content": patient_context})
+    for msg in recent:
+        groq_messages.append({"role": msg["role"], "content": msg["content"]})
+    groq_messages.append({"role": "user", "content": body.message})
+
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": groq_messages,
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
+        "stream": True,
+    }
+    if "gpt-oss" in GROQ_MODEL:
+        payload["reasoning_effort"] = "low"
+
+    async def event_gen():
+        import httpx
+
+        full: list[str] = []
+        try:
+            async with httpx.AsyncClient(timeout=90) as client:
+                async with client.stream(
+                    "POST",
+                    GROQ_URL,
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json=payload,
+                ) as response:
+                    if response.status_code != 200:
+                        detail = "AI service error. Please try again."
+                        if response.status_code == 429:
+                            detail = "The AI is a bit busy right now. Please wait a few seconds and try again."
+                        yield f"data: {json.dumps({'error': detail})}\n\n"
+                        return
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        chunk = line[6:]
+                        if chunk == "[DONE]":
+                            break
+                        try:
+                            delta = json.loads(chunk)["choices"][0]["delta"].get("content")
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+                        if delta:
+                            full.append(delta)
+                            yield f"data: {json.dumps({'delta': delta})}\n\n"
+        except httpx.TimeoutException:
+            yield f"data: {json.dumps({'error': 'AI service timed out. Please try again.'})}\n\n"
+            return
+        except httpx.HTTPError:
+            yield f"data: {json.dumps({'error': 'Could not connect to the AI service.'})}\n\n"
+            return
+
+        reply_text = "".join(full).strip()
+        if not reply_text:
+            yield f"data: {json.dumps({'error': 'AI returned an empty response. Please try again.'})}\n\n"
+            return
+
+        reply_timestamp = _now_iso()
+        await db.chat_sessions.update_one(
+            {"_id": session["_id"]},
+            {
+                "$push": {"messages": {"$each": [user_msg, {"role": "assistant", "content": reply_text, "timestamp": reply_timestamp}]}},
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+        yield f"data: {json.dumps({'done': True, 'session_id': session_id, 'timestamp': reply_timestamp})}\n\n"
+
+    from fastapi.responses import StreamingResponse
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -535,7 +654,8 @@ async def synthesize_speech(body: TTSRequest):
     text = text[:3500]
 
     # Devanagari → Hindi neural voice; otherwise Indian-English voice.
-    voice = "hi-IN-SwaraNeural" if re.search(r"[ऀ-ॿ]", text) else "en-IN-NeerjaNeural"
+    # Male voices to match the doctor avatar.
+    voice = "hi-IN-MadhurNeural" if re.search(r"[ऀ-ॿ]", text) else "en-IN-PrabhatNeural"
 
     try:
         communicate = edge_tts.Communicate(text, voice)
