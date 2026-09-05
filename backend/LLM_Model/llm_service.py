@@ -48,7 +48,7 @@ def _call_groq(prompt: str) -> dict:
     }
     payload = {
         # llama-3.1-8b-instant was decommissioned on Groq; use an available model.
-        "model": "openai/gpt-oss-20b",
+        "model": "openai/gpt-oss-120b",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": TEMPERATURE,
         "max_tokens": 2000,
